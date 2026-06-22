@@ -45,15 +45,18 @@ def _load_model():
     return model
 
 
-def embed_candidates(candidates: list, batch_size: int = 256) -> None:
+def embed_candidates(candidates: list, batch_size: int = 256, checkpoint_every: int = 20) -> None:
     """
-    Encode claims_text and narrative_text for all candidates and cache to disk.
+    Encode claims_text and narrative_text for all candidates and cache to disk,
+    saving progress every `checkpoint_every` batches so an interruption never
+    loses more than a few minutes of work.
 
     Only newly-seen candidate_ids are encoded; existing cache entries are kept.
 
     Args:
-        candidates:  List of candidate dicts.
-        batch_size:  Sentence-transformer encoding batch size.
+        candidates:        List of candidate dicts.
+        batch_size:        Sentence-transformer encoding batch size.
+        checkpoint_every:  Save to disk after this many batches.
     """
     import sys
     sys.path.insert(0, os.path.dirname(__file__))
@@ -66,8 +69,8 @@ def embed_candidates(candidates: list, batch_size: int = 256) -> None:
         with open(IDS_PATH, encoding='utf-8') as f:
             cached_ids: list = json.load(f)
         cached_set = set(cached_ids)
-        cached_claims = np.load(CLAIMS_PATH)       # (N_old, 384)
-        cached_narrative = np.load(NARRATIVE_PATH)  # (N_old, 384)
+        cached_claims = np.load(CLAIMS_PATH)
+        cached_narrative = np.load(NARRATIVE_PATH)
     else:
         cached_ids = []
         cached_set = set()
@@ -88,42 +91,65 @@ def embed_candidates(candidates: list, batch_size: int = 256) -> None:
 
     new_ids = [c['candidate_id'] for c in new_candidates]
     evidences = [build_evidence(c) for c in new_candidates]
-    claims_texts   = [e['claims_text'] for e in evidences]
+    claims_texts = [e['claims_text'] for e in evidences]
     narrative_texts = [e['narrative_text'] for e in evidences]
 
-    print(f"Encoding {len(new_ids)} candidates (batch_size={batch_size})...")
-    new_claims_emb = model.encode(
-        claims_texts,
-        batch_size=batch_size,
-        normalize_embeddings=True,
-        show_progress_bar=True,
-    ).astype(np.float32)
+    n = len(new_ids)
+    num_batches = (n + batch_size - 1) // batch_size
 
-    new_narrative_emb = model.encode(
-        narrative_texts,
-        batch_size=batch_size,
-        normalize_embeddings=True,
-        show_progress_bar=True,
-    ).astype(np.float32)
+    def _save_progress(up_to_idx: int):
+        """Save everything encoded so far (both cached + newly done up to up_to_idx)."""
+        done_ids = new_ids[:up_to_idx]
+        done_claims = claims_buffer[:up_to_idx]
+        done_narrative = narrative_buffer[:up_to_idx]
 
-    # Append to existing cache
-    if cached_claims is not None:
-        all_claims = np.vstack([cached_claims, new_claims_emb])
-        all_narrative = np.vstack([cached_narrative, new_narrative_emb])
-    else:
-        all_claims = new_claims_emb
-        all_narrative = new_narrative_emb
+        if cached_claims is not None:
+            all_claims = np.vstack([cached_claims, done_claims])
+            all_narrative = np.vstack([cached_narrative, done_narrative])
+        else:
+            all_claims = done_claims
+            all_narrative = done_narrative
 
-    all_ids = cached_ids + new_ids
+        all_ids = cached_ids + done_ids
 
-    # Persist
-    with open(IDS_PATH, 'w', encoding='utf-8') as f:
-        json.dump(all_ids, f)
-    np.save(CLAIMS_PATH, all_claims)
-    np.save(NARRATIVE_PATH, all_narrative)
+        with open(IDS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(all_ids, f)
+        np.save(CLAIMS_PATH, all_claims)
+        np.save(NARRATIVE_PATH, all_narrative)
+        print(f"  [checkpoint] saved {len(all_ids)} total candidates to disk")
 
-    print(f"Cache updated: {len(all_ids)} candidates total; "
-          f"shapes claims={all_claims.shape}, narrative={all_narrative.shape}")
+    print(f"Encoding {n} candidates in {num_batches} batches "
+          f"(batch_size={batch_size}, checkpoint every {checkpoint_every} batches)...")
+
+    claims_buffer = np.zeros((n, 384), dtype=np.float32)
+    narrative_buffer = np.zeros((n, 384), dtype=np.float32)
+
+    for batch_num, start in enumerate(range(0, n, batch_size), start=1):
+        end = min(start + batch_size, n)
+
+        batch_claims = model.encode(
+            claims_texts[start:end],
+            batch_size=batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).astype(np.float32)
+
+        batch_narrative = model.encode(
+            narrative_texts[start:end],
+            batch_size=batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).astype(np.float32)
+
+        claims_buffer[start:end] = batch_claims
+        narrative_buffer[start:end] = batch_narrative
+
+        print(f"  batch {batch_num}/{num_batches} done ({end}/{n} candidates)")
+
+        if batch_num % checkpoint_every == 0 or batch_num == num_batches:
+            _save_progress(end)
+
+    print(f"Cache updated: {len(cached_ids) + n} candidates total")
 
 
 def embed_jd(jd_text: str) -> None:

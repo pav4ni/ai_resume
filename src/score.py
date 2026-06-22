@@ -11,12 +11,12 @@ Architecture:
 
 Cosine similarity note:
   All embeddings are L2-normalised (done in embed.py), so cosine = dot product.
-  Mapping from [-1, 1] to [0, 1]: mapped = (cos + 1) / 2
+  Raw clamped cosine: max(0.0, cos) — values below 0 are floored to 0.
 
 Layer weights (in combine_score):
-  W_SEMANTIC_FIT  = 0.60   -- dominant: direct JD relevance
-  W_CONSISTENCY   = 0.25   -- penalise resume inflation
-  W_STRUCTURED    = 0.15   -- rules / heuristics
+  W_SEMANTIC  = 0.40   -- direct JD narrative relevance
+  W_STRUCTURED = 0.35  -- rules / heuristics (raised to carry more signal)
+  W_CONSISTENCY = 0.25 -- penalise resume inflation
 """
 
 import os
@@ -28,9 +28,15 @@ from typing import Optional
 import numpy as np
 
 # ---- Weight constants -------------------------------------------------------
-W_SEMANTIC_FIT = 0.60
-W_CONSISTENCY  = 0.25
-W_STRUCTURED   = 0.15
+# Weights sum to 1.0.  Structured raised to 0.35 so deterministic rules
+# (location, YOE, keyword-stuffer penalty) carry meaningful signal alongside
+# embedding layers.
+W_SEMANTIC    = 0.25   # narrative embedding vs JD — reduced after empirical testing
+                        # showed embedding similarity alone unreliably ranked genuine
+                        # retrieval/ranking fits below generic technical candidates
+W_STRUCTURED  = 0.50   # deterministic heuristics — raised to primary signal after
+                        # outperforming embeddings on known sanity-check candidates
+W_CONSISTENCY = 0.25   # claims embedding vs narrative embedding
 
 # ---- Reference date for recency calculations --------------------------------
 REFERENCE_DATE = date(2026, 6, 20)
@@ -51,6 +57,38 @@ NLP_IR_KEYWORDS = {
     'ranking', 'recommendation', 'transformers', 'sentence transformers',
     'semantic search', 'vector search', 'faiss', 'pinecone',
 }
+
+# ---- AI/ML/retrieval terms for keyword-stuffer rule ------------------------
+# Used in structured_rule_score to detect non-technical titles claiming heavy
+# advanced AI expertise (a documented red flag in the JD spec).
+AI_ML_TERMS = {
+    'embeddings', 'embedding', 'retrieval', 'ranking', 'recommendation',
+    'recommendation systems', 'information retrieval', 'faiss', 'pinecone',
+    'weaviate', 'qdrant', 'milvus', 'sentence transformers', 'transformers',
+    'hugging face', 'nlp', 'llm', 'llms', 'fine-tuning llms', 'lora', 'qlora',
+    'rag', 'semantic search', 'vector', 'machine learning', 'deep learning',
+    'neural', 'pytorch', 'tensorflow', 'scikit-learn', 'mlops', 'mlflow',
+    'learning to rank', 'bm25', 'cnn', 'gan', 'gans', 'diffusion',
+}
+
+GENERIC_AI_BUZZWORDS = {
+    'ai', 'a.i.', 'artificial intelligence', 'ai/ml', 'ai tools', 'chatgpt',
+    'gpt', 'genai', 'generative ai', 'ai-assisted', 'ai capabilities',
+    'ai-powered', 'machine learning', 'ml',
+}
+
+RETRIEVAL_ML_CORE_TERMS = {
+    'embeddings', 'embedding', 'retrieval', 'information retrieval', 'ranking',
+    'recommendation', 'recommendation systems', 'recommender', 'faiss',
+    'pinecone', 'weaviate', 'qdrant', 'milvus', 'vector search', 'vector database',
+    'semantic search', 'hybrid search', 'bm25', 'learning to rank', 'ndcg',
+    'mrr', 'map', 'sentence transformers', 'rag',
+}
+
+# Technical title qualifiers: a title is TECHNICAL if it contains any of these words,
+# OR if it contains 'analyst' together with a tech qualifier.
+_TECHNICAL_TITLE_WORDS = {'engineer', 'developer', 'scientist', 'architect', 'researcher'}
+_ANALYST_TECH_QUALIFIERS = {'data', 'ml', 'machine learning', 'ai', 'quantitative'}
 
 # ---- Location tables -------------------------------------------------------
 PUNE_NOIDA_KEYWORDS   = {'pune', 'noida'}
@@ -92,9 +130,12 @@ def _get_embeddings(candidate: dict):
     return cache['claims'][row], cache['narrative'][row], cache['jd']
 
 
-def _cos_to_01(cos: float) -> float:
-    """Map cosine similarity from [-1, 1] to [0, 1] via (cos+1)/2."""
-    return (float(cos) + 1.0) / 2.0
+def _cos_clamp(cos: float) -> float:
+    """Clamp raw cosine similarity to [0, 1]: max(0.0, cos).
+    Embeddings are L2-normalised so cosine = dot product, range [-1, 1].
+    Negative cosines (opposite-direction vectors) are treated as zero signal.
+    """
+    return max(0.0, float(cos))
 
 
 # ============================================================
@@ -104,12 +145,12 @@ def _cos_to_01(cos: float) -> float:
 def semantic_fit_score(candidate: dict) -> float:
     """
     Cosine similarity between the candidate's narrative_emb and the JD embedding.
-    Maps from [-1, 1] → [0, 1] via (cos+1)/2.
+    Uses raw clamped cosine: max(0.0, cos) — negative similarities are zeroed.
     Higher = narrative content aligns with the JD role.
     """
     _, narrative_vec, jd_vec = _get_embeddings(candidate)
     cos = float(np.dot(narrative_vec, jd_vec))
-    return _cos_to_01(cos)
+    return _cos_clamp(cos)
 
 
 # ============================================================
@@ -119,12 +160,12 @@ def semantic_fit_score(candidate: dict) -> float:
 def consistency_score(candidate: dict) -> float:
     """
     Cosine similarity between claims_emb and narrative_emb.
-    Maps from [-1, 1] → [0, 1] via (cos+1)/2.
+    Uses raw clamped cosine: max(0.0, cos) — negative similarities are zeroed.
     Low similarity → claims don't match history → lower score (resume inflation red flag).
     """
     claims_vec, narrative_vec, _ = _get_embeddings(candidate)
     cos = float(np.dot(claims_vec, narrative_vec))
-    return _cos_to_01(cos)
+    return _cos_clamp(cos)
 
 
 # ============================================================
@@ -140,6 +181,7 @@ def structured_rule_score(candidate: dict) -> float:
       2. Services-firm-only penalty: if every employer is a known IT services firm.
       3. CV/speech/robotics-only penalty: if skills/narrative show only CV/robotics with
          zero NLP/IR signal.
+      3b. Keyword-stuffer penalty: non-technical title + 3+ advanced/expert AI/ML skills.
       4. Location boost/penalty:
            Pune/Noida         → +0.15
            Hyderabad/Mumbai/Delhi-NCR → +0.10
@@ -200,6 +242,48 @@ def structured_rule_score(candidate: dict) -> float:
     if has_cv_signal and not has_nlp_signal:
         score -= 0.10  # pure CV/speech/robotics, no NLP/IR signal
 
+    # --- 3b. Narrative AI-vocabulary inflation penalty ---
+    # Catches candidates whose narrative/summary leans on GENERIC AI buzzwords
+    # ("ai tools", "chatgpt", "ai/ml") without any SPECIFIC technical vocabulary
+    # (embeddings, retrieval, transformers, etc.) or skills backing. This is the
+    # "content writer talking about AI" pattern — distinct from a skills-list stuffer.
+    title_lower = profile.get('current_title', '').lower()
+ 
+    is_technical_title = any(word in title_lower for word in _TECHNICAL_TITLE_WORDS)
+    if not is_technical_title and 'analyst' in title_lower:
+        is_technical_title = any(q in title_lower for q in _ANALYST_TECH_QUALIFIERS)
+ 
+    generic_ai_hits = sum(1 for term in GENERIC_AI_BUZZWORDS if term in narrative)
+    specific_ai_hits = sum(1 for term in AI_ML_TERMS if term in narrative)
+ 
+    skill_ai_terms_backed = {
+        s.get('name', '').lower() for s in skills
+        if s.get('name', '').lower() in AI_ML_TERMS
+        and s.get('proficiency', '').lower() in ('intermediate', 'advanced', 'expert')
+    }
+ 
+    if not is_technical_title:
+        # Generic AI talk, no real technical depth, no skills backing → strong stuffer signal
+        if generic_ai_hits >= 2 and specific_ai_hits <= 1 and len(skill_ai_terms_backed) == 0:
+            score -= 0.25
+        elif generic_ai_hits >= 1 and specific_ai_hits == 0:
+            score -= 0.10
+    else:
+        # Technical title but narrative is still generic-AI-heavy with no real depth
+        if generic_ai_hits >= 3 and specific_ai_hits == 0 and len(skill_ai_terms_backed) == 0:
+            score -= 0.10
+ 
+    # Original skills-only stuffer check, kept as a secondary signal:
+    # non-technical title + 3+ advanced/expert AI/ML skills.
+    if not is_technical_title:
+        strong_ai_skill_count = sum(
+            1 for s in skills
+            if s.get('proficiency', '').lower() in ('advanced', 'expert')
+            and s.get('name', '').lower() in AI_ML_TERMS
+        )
+        if strong_ai_skill_count >= 3:
+            score -= 0.25
+
     # --- 4. Location boost/penalty ---
     location_lower = profile.get('location', '').lower()
     country = profile.get('country', '').strip()
@@ -212,8 +296,33 @@ def structured_rule_score(candidate: dict) -> float:
         score += 0.10
     # Other Indian cities: no change from base
 
-    return max(0.0, min(1.0, score))
+    # --- 5. Genuine retrieval/ranking/ML relevance boost ---
+    # The JD's actual hard requirements are narrow and specific. Generic technical
+    # titles (Frontend, Mobile, Java Dev, etc.) should NOT outscore a candidate with
+    # real evidence of embeddings/retrieval/ranking work just because they clear the
+    # YOE/location/title-format bar. This rule rewards specific relevant evidence.
+    relevance_hits_narrative = sum(1 for term in RETRIEVAL_ML_CORE_TERMS if term in narrative)
+ 
+    relevant_skills = [
+        s for s in skills
+        if s.get('name', '').lower() in RETRIEVAL_ML_CORE_TERMS
+        and s.get('proficiency', '').lower() in ('intermediate', 'advanced', 'expert')
+    ]
+ 
+    relevance_title_words = {'recommendation', 'search', 'ranking', 'retrieval', 'nlp', 'ml', 'ai'}
+    title_is_directly_relevant = any(w in title_lower for w in relevance_title_words)
+ 
+    relevance_boost = 0.0
+    if relevance_hits_narrative >= 2 and len(relevant_skills) >= 1:
+        relevance_boost = 0.25
+    elif relevance_hits_narrative >= 1 or len(relevant_skills) >= 1:
+        relevance_boost = 0.12
+    if title_is_directly_relevant:
+        relevance_boost += 0.10
+ 
+    score += relevance_boost
 
+    return max(0.0, min(1.0, score))
 
 # ============================================================
 # Layer 4 — Honeypot Guard
@@ -330,7 +439,7 @@ def combine_score(candidate: dict) -> float:
     sr = structured_rule_score(candidate)
     bm = behavioral_modifier(candidate)
 
-    return (W_SEMANTIC_FIT * sf + W_CONSISTENCY * cs + W_STRUCTURED * sr) * bm
+    return (W_SEMANTIC * sf + W_CONSISTENCY * cs + W_STRUCTURED * sr) * bm
 
 
 # ============================================================
