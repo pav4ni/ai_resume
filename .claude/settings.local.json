@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(unzip -l \"[PUB] India_runs_data_and_ai_challenge.zip\")",
+      "Bash(unzip -o -j '[PUB] India_runs_data_and_ai_challenge.zip' __TRACKED_VAR__/candidate_schema.json __TRACKED_VAR__/validate_submission.py __TRACKED_VAR__/submission_metadata_template.yaml __TRACKED_VAR__/sample_submission.csv __TRACKED_VAR__/job_description.docx __TRACKED_VAR__/submission_spec.docx __TRACKED_VAR__/README.docx __TRACKED_VAR__/redrob_signals_doc.docx -d extracted)",
+      "Bash(unzip -o '\\\\[PUB\\\\] India_runs_data_and_ai_challenge.zip' -d extracted -x *candidates.jsonl *__MACOSX* *.DS_Store *sample_candidates.json)",
+      "Bash(rm -rf extracted)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(python -c ' *)",
+      "Bash(python profile_pool.py)",
+      "Bash(python honeypot_probe.py)",
+      "PowerShell(pip *)"
+    ]
+  }
+}
