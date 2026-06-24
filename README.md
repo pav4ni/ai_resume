@@ -1,4 +1,4 @@
-# Hackathon Recruiter AI — Candidate Ranking Pipeline
+# Recruiter AI — Candidate Ranking Pipeline
 
 ## Reproduce
 
